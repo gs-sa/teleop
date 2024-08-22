@@ -1,6 +1,13 @@
 use nalgebra::Isometry3;
 use serde::Deserialize;
 use std::{io::Read, net::TcpStream, sync::mpsc::channel, thread::{sleep, spawn}, time::{Duration, Instant}};
+use franka::{Frame, MotionFinished};
+use franka::FrankaResult;
+use franka::Robot;
+use franka::RobotState;
+use franka::Torques;
+use franka::{array_to_isometry, Matrix6x7, Vector7};
+use nalgebra::{Matrix3, Matrix6, Matrix6x1, UnitQuaternion, Vector3, U1, U3};
 
 #[derive(Debug, Deserialize)]
 struct PoseData {
@@ -49,34 +56,6 @@ fn main() {
         tx.send(change).unwrap();
     }
 }
-
-fn robot_control(rx: std::sync::mpsc::Receiver<Isometry3<f32>>) {
-    let mut last_change = nalgebra::Isometry3::identity();
-    loop {
-        let change = match rx.try_recv() {
-            Ok(p) => {
-                last_change = p;
-                p
-            }
-            Err(e) => {
-                if e == std::sync::mpsc::TryRecvError::Empty {
-                    last_change
-                } else {
-                    break;
-                }
-            }
-        };
-        // robot 
-    }
-}
-
-use franka::{Frame, MotionFinished};
-use franka::FrankaResult;
-use franka::Robot;
-use franka::RobotState;
-use franka::Torques;
-use franka::{array_to_isometry, Matrix6x7, Vector7};
-use nalgebra::{Matrix3, Matrix6, Matrix6x1, UnitQuaternion, Vector3, U1, U3};
 
 
 fn robot_control_(franka_ip: String, rx: std::sync::mpsc::Receiver<Isometry3<f64>>) -> FrankaResult<()> {
