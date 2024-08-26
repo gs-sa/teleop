@@ -1,18 +1,28 @@
-use nalgebra::Isometry3;
-use serde::Deserialize;
-use std::{io::Read, net::TcpStream, sync::mpsc::channel, thread::{sleep, spawn}, time::{Duration, Instant}};
-use franka::{Frame, MotionFinished};
 use franka::FrankaResult;
 use franka::Robot;
 use franka::RobotState;
 use franka::Torques;
-use franka::{array_to_isometry, Matrix6x7, Vector7};
-use nalgebra::{Matrix3, Matrix6, Matrix6x1, UnitQuaternion, Vector3, U1, U3};
+use franka::{Frame, MotionFinished};
+use nalgebra::Matrix6;
+use nalgebra::Quaternion as NaQuaternion;
+use nalgebra::Rotation3;
+use nalgebra::Translation3;
+use nalgebra::{Isometry3, Matrix4, SMatrix};
+use nalgebra::{Matrix3, Matrix6x1, UnitQuaternion, Vector3};
+use serde::Deserialize;
+use tungstenite::connect;
+use std::{sync::mpsc::channel, thread::spawn, time::Duration};
 
 #[derive(Debug, Deserialize)]
 struct PoseData {
     quaternion: Quaternion,
     translation: Translation,
+}
+
+impl PoseData {
+    fn to_isometry(&self) -> Isometry3<f64> {
+        Isometry3::from_parts(Translation3::new(self.translation.x, self.translation.y, self.translation.z), UnitQuaternion::from_quaternion(NaQuaternion::new(self.quaternion.w, self.quaternion.x, self.quaternion.y, self.quaternion.z)))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,39 +42,37 @@ struct Translation {
 
 fn main() {
     let (tx, rx) = channel();
-    let mut tcp_stream = TcpStream::connect("192.168.5.9:8080").unwrap();
+    let (mut ws, _) = connect("ws://192.168.5.12:8080").unwrap();
     println!("Connected to the server!");
-    let mut v = vec![0; 512];
-    let mut last_pose = nalgebra::Isometry3::identity();
-    spawn(||{
-        robot_control(rx);
+
+    let m_to_mee = Isometry3::from_parts(
+        Translation3::identity(), 
+        Rotation3::from_matrix(&Matrix3::from_column_slice(&[
+            0.,1.,0.,
+            1.,0.,0.,
+            0.,0.,-1.
+        ])).into()
+    );
+    let mut mo_t_m_prev = None;
+    spawn(|| {
+        robot_control("192.168.1.100".to_owned(), rx).unwrap();
     });
     loop {
-        let size = tcp_stream.read(&mut v).unwrap();
-        let pose: PoseData = serde_json::from_slice(&v[0..size]).unwrap();
-        let t =
-            nalgebra::Translation3::new(pose.translation.x, pose.translation.y, pose.translation.z);
-        let q = nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new (
-            pose.quaternion.w,
-            pose.quaternion.x,
-            pose.quaternion.y,
-            pose.quaternion.z,
-        ));
-        let pose = nalgebra::Isometry3::from_parts(t, q);
-        let change = last_pose.inv_mul(&pose);
-        last_pose = pose;
-        tx.send(change).unwrap();
+        let msg = ws.read().unwrap();
+        let pose: PoseData = serde_json::from_slice(&msg.into_data()).unwrap();
+        let mo_t_m = pose.to_isometry();
+        let delta = mo_t_m_prev.map(|mo_t_m_prev: Isometry3<f64>|{
+            let mprev_t_m = mo_t_m_prev.inv_mul(&mo_t_m);
+            m_to_mee.inv_mul(&(mprev_t_m * m_to_mee))
+        });
+        mo_t_m_prev = Some(mo_t_m);
+        if delta.is_some() {tx.send(delta.unwrap()).unwrap()}
     }
 }
 
-
-fn robot_control_(franka_ip: String, rx: std::sync::mpsc::Receiver<Isometry3<f64>>) -> FrankaResult<()> {
-    let mut last_change = nalgebra::Isometry3::identity();
-    let translational_stiffness = 150.;
-    let rotational_stiffness = 10.;
-
-    let mut stiffness: Matrix6<f64> = Matrix6::zeros();
-    let mut damping: Matrix6<f64> = Matrix6::zeros();
+fn stiffness_damping(translational_stiffness: f64, rotational_stiffness: f64) -> (Matrix6<f64>, Matrix6<f64>){
+    let mut stiffness = SMatrix::<f64, 6, 6>::zeros();
+    let mut damping = SMatrix::<f64, 6, 6>::zeros();
     {
         let mut top_left_corner = stiffness.fixed_view_mut::<3, 3>(0, 0);
         top_left_corner.copy_from(&(Matrix3::identity() * translational_stiffness));
@@ -78,7 +86,18 @@ fn robot_control_(franka_ip: String, rx: std::sync::mpsc::Receiver<Isometry3<f64
         bottom_right_corner
             .copy_from(&(2. * f64::sqrt(rotational_stiffness) * Matrix3::identity()));
     }
-    let mut robot = Robot::new(&franka_ip, None, None)?;
+    (stiffness, damping)
+}
+
+fn robot_control(
+    franka_ip: String,
+    rx: std::sync::mpsc::Receiver<Isometry3<f64>>,
+) -> FrankaResult<()> {
+    // start config
+
+    let (stiffness, damping) = stiffness_damping(300., 20.);
+    
+    let mut robot = Robot::new(&franka_ip, Some(franka::RealtimeConfig::Ignore), None)?;
     let model = robot.load_model(true)?;
 
     // Set additional parameters always before the control loop, NEVER in the control loop!
@@ -88,11 +107,7 @@ fn robot_control_(franka_ip: String, rx: std::sync::mpsc::Receiver<Isometry3<f64
     )?;
     robot.set_joint_impedance([3000., 3000., 3000., 2500., 2500., 2000., 2000.])?;
     robot.set_cartesian_impedance([3000., 3000., 3000., 300., 300., 300.])?;
-    let initial_state = robot.read_once()?;
-    let initial_transform = array_to_isometry(&initial_state.O_T_EE);
-    let position_d = initial_transform.translation.vector;
-    let orientation_d = initial_transform.rotation;
-
+    
     println!(
         "WARNING: Collision thresholds are set to high values. \
              Make sure you have the user stop at hand!"
@@ -100,45 +115,55 @@ fn robot_control_(franka_ip: String, rx: std::sync::mpsc::Receiver<Isometry3<f64
     println!("After starting try to push the robot and see how it reacts.");
     println!("Press Enter to continue...");
     std::io::stdin().read_line(&mut String::new()).unwrap();
-    let result = robot.control_torques(
+    // end config
+
+    let state = robot.read_once().unwrap();
+    let rot = nalgebra::Rotation3::<f64>::from_matrix(
+        &Matrix4::from_column_slice(&state.O_T_EE)
+            .remove_column(3)
+            .remove_row(3),
+    );
+    let mut robot_ee_pose_d = Isometry3::from_parts(
+        Vector3::new(state.O_T_EE[12], state.O_T_EE[13], state.O_T_EE[14]).into(),
+        rot.into(),
+    );
+    let result: Result<(), franka::exception::FrankaException> = robot.control_torques(
         |state: &RobotState, _step: &Duration| -> Torques {
-            let change = match rx.try_recv() {
-                Ok(p) => {
-                    last_change = p;
-                    p
-                }
-                Err(e) => {
-                    if e == std::sync::mpsc::TryRecvError::Empty {
-                        last_change
-                    } else {
-                        return Torques::new([0., 0., 0., 0., 0., 0., 0.]).motion_finished();
-                    }
-                }
+            match rx.try_recv() {
+                Ok(delta) => {
+                    robot_ee_pose_d *= delta;
+                },
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Torques::new([0., 0., 0., 0., 0., 0., 0.]).motion_finished();
+                },
+                _=>{}
             };
 
-            let coriolis: Vector7 = model.coriolis_from_state(&state).into();
-            let jacobian_array = model.zero_jacobian_from_state(&Frame::EndEffector, &state);
-            let jacobian = Matrix6x7::from_column_slice(&jacobian_array);
-            let _q = Vector7::from_column_slice(&state.q);
-            let dq = Vector7::from_column_slice(&state.dq);
-            let current_transform = array_to_isometry(&state.O_T_EE);
             let rot = nalgebra::Rotation3::<f64>::from_matrix(
                 &Matrix4::from_column_slice(&state.O_T_EE)
                     .remove_column(3)
                     .remove_row(3),
             );
-            let current_transform = Isometry3::from_parts(
+            let robot_ee_pose = Isometry3::from_parts(
                 Vector3::new(state.O_T_EE[12], state.O_T_EE[13], state.O_T_EE[14]).into(),
                 rot.into(),
             );
-            let transform = current_transform * last_change;
-            
-            let position = transform.translation.vector;
-            let mut orientation = *transform.rotation.quaternion();
+
+            let position = robot_ee_pose.translation.vector;
+            let mut orientation = *robot_ee_pose.rotation.quaternion();
+
+            let position_d = robot_ee_pose_d.translation.vector;
+            let orientation_d: UnitQuaternion<f64> = robot_ee_pose_d.rotation;
+
+            let coriolis: SMatrix<f64, 7, 1> = model.coriolis_from_state(&state).into();
+            let jacobian_array = model.zero_jacobian_from_state(&Frame::EndEffector, &state);
+            let jacobian = SMatrix::<f64, 6, 7>::from_column_slice(&jacobian_array);
+            // let _q = Vector7::from_column_slice(&state.q);
+            let dq = SMatrix::<f64, 7, 1>::from_column_slice(&state.dq);
 
             let mut error: Matrix6x1<f64> = Matrix6x1::<f64>::zeros();
             {
-                let mut error_head = error.fixed_slice_mut::<U3, U1>(0, 0);
+                let mut error_head = error.fixed_view_mut::<3, 1>(0, 0);
                 error_head.set_column(0, &(position - position_d));
             }
 
@@ -148,17 +173,17 @@ fn robot_control_(franka_ip: String, rx: std::sync::mpsc::Receiver<Isometry3<f64
             let orientation = UnitQuaternion::new_normalize(orientation);
             let error_quaternion: UnitQuaternion<f64> = orientation.inverse() * orientation_d;
             {
-                let mut error_tail = error.fixed_slice_mut::<U3, U1>(3, 0);
+                let mut error_tail = error.fixed_view_mut::<3, 1>(3, 0);
                 error_tail.copy_from(
-                    &-(transform.rotation.to_rotation_matrix()
+                    &-(robot_ee_pose.rotation.to_rotation_matrix()
                         * Vector3::new(error_quaternion.i, error_quaternion.j, error_quaternion.k)),
                 );
             }
-            let tau_task: Vector7 =
-                jacobian.transpose() * (-stiffness * error - damping * (jacobian * dq));
-            let tau_d: Vector7 = tau_task + coriolis;
-
-            tau_d.into()
+            let tau_task = jacobian.transpose() * (-stiffness * error - damping * (jacobian * dq));
+            let tau_d = tau_task + coriolis;
+            Torques::new([
+                tau_d[0], tau_d[1], tau_d[2], tau_d[3], tau_d[4], tau_d[5], tau_d[6],
+            ])
         },
         None,
         None,
