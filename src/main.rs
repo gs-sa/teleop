@@ -11,6 +11,7 @@ use nalgebra::{Isometry3, Matrix4, SMatrix};
 use nalgebra::{Matrix3, Matrix6x1, UnitQuaternion, Vector3};
 use serde::Deserialize;
 use tungstenite::connect;
+use std::f64::consts::TAU;
 use std::{sync::mpsc::channel, thread::spawn, time::Duration};
 
 #[derive(Debug, Deserialize)]
@@ -45,7 +46,7 @@ fn main() {
     let (mut ws, _) = connect("ws://192.168.5.12:8080").unwrap();
     println!("Connected to the server!");
     let cam_t_a1 = Isometry3::from_parts(
-        Translation3::new(-0.0786, 0.061195, 0.001781),
+        Translation3::new(0.0786, -0.061195, 0.001781),
         Rotation3::identity().into(),
     );
     let a = 15. * TAU / 360.;
@@ -61,7 +62,7 @@ fn main() {
 
     let a = 11. * TAU / 360.;
     let a2_t_a3 = Isometry3::from_parts(
-        Translation3::new(0., 0.015, 0.),
+        Translation3::new(0., -0.015, 0.),
         Rotation3::from_matrix(&Matrix3::from_column_slice(&[
             a.cos(), 0., a.sin(), 
             0., 1., 0., 
@@ -88,7 +89,7 @@ fn main() {
         let o_t_cam = pose.to_isometry();
         let delta = o_t_cam_prev.map(|o_t_cam_prev: Isometry3<f64>|{
             let camprev_t_camnow = o_t_cam_prev.inv_mul(&o_t_cam);
-            cam_t_mee.inv_mul(&(camprev_t_cam * cam_t_mee))
+            cam_t_mee.inv_mul(&(camprev_t_camnow * cam_t_mee))
         });
         o_t_cam_prev = Some(o_t_cam);
         if delta.is_some() {tx.send(delta.unwrap()).unwrap()}
