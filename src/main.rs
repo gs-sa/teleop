@@ -44,28 +44,53 @@ fn main() {
     let (tx, rx) = channel();
     let (mut ws, _) = connect("ws://192.168.5.12:8080").unwrap();
     println!("Connected to the server!");
-
-    let m_to_mee = Isometry3::from_parts(
-        Translation3::identity(), 
-        Rotation3::from_matrix(&Matrix3::from_column_slice(&[
-            0.,1.,0.,
-            1.,0.,0.,
-            0.,0.,-1.
-        ])).into()
+    let cam_t_a1 = Isometry3::from_parts(
+        Translation3::new(-0.0786, 0.061195, 0.001781),
+        Rotation3::identity().into(),
     );
-    let mut mo_t_m_prev = None;
+    let a = 15. * TAU / 360.;
+    let a1_t_a2 = Isometry3::from_parts(
+        Translation3::identity(),
+        Rotation3::from_matrix(&Matrix3::from_column_slice(&[
+            1., 0., 0., 
+            0., a.cos(), -a.sin(), 
+            0., a.sin(), a.cos(),
+        ]))
+        .into(),
+    );
+
+    let a = 11. * TAU / 360.;
+    let a2_t_a3 = Isometry3::from_parts(
+        Translation3::new(0., 0.015, 0.),
+        Rotation3::from_matrix(&Matrix3::from_column_slice(&[
+            a.cos(), 0., a.sin(), 
+            0., 1., 0., 
+            -a.sin(), 0., a.cos(),
+        ]))
+        .into(),
+    );
+    let a3_t_mee = Isometry3::from_parts(
+        Translation3::identity(),
+        Rotation3::from_matrix(&Matrix3::from_column_slice(&[
+            0., 1., 0., 1., 0., 0., 0., 0., -1.,
+        ]))
+        .into(),
+    );
+    let cam_t_mee = cam_t_a1 * a1_t_a2 * a2_t_a3 * a3_t_mee;
+
+    let mut o_t_cam_prev = None;
     spawn(|| {
         robot_control("192.168.1.100".to_owned(), rx).unwrap();
     });
     loop {
         let msg = ws.read().unwrap();
         let pose: PoseData = serde_json::from_slice(&msg.into_data()).unwrap();
-        let mo_t_m = pose.to_isometry();
-        let delta = mo_t_m_prev.map(|mo_t_m_prev: Isometry3<f64>|{
-            let mprev_t_m = mo_t_m_prev.inv_mul(&mo_t_m);
-            m_to_mee.inv_mul(&(mprev_t_m * m_to_mee))
+        let o_t_cam = pose.to_isometry();
+        let delta = o_t_cam_prev.map(|o_t_cam_prev: Isometry3<f64>|{
+            let camprev_t_camnow = o_t_cam_prev.inv_mul(&o_t_cam);
+            cam_t_mee.inv_mul(&(camprev_t_cam * cam_t_mee))
         });
-        mo_t_m_prev = Some(mo_t_m);
+        o_t_cam_prev = Some(o_t_cam);
         if delta.is_some() {tx.send(delta.unwrap()).unwrap()}
     }
 }
